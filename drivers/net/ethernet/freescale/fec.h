@@ -16,6 +16,9 @@
 #include <linux/clocksource.h>
 #include <linux/net_tstamp.h>
 #include <linux/ptp_clock_kernel.h>
+#include <linux/netdevice.h>
+#include <linux/etherdevice.h>
+#include <linux/circ_buf.h>
 
 #if defined(CONFIG_M523x) || defined(CONFIG_M527x) || defined(CONFIG_M528x) || \
     defined(CONFIG_M520x) || defined(CONFIG_M532x) || \
@@ -38,12 +41,12 @@
 #define FEC_ADDR_LOW		0x0e4 /* Low 32bits MAC address */
 #define FEC_ADDR_HIGH		0x0e8 /* High 16bits MAC address */
 #define FEC_OPD			0x0ec /* Opcode + Pause duration */
-#define FEC_TXIC0		0xF0  /* Tx Interrupt Coalescing for ring 0 */
-#define FEC_TXIC1		0xF4  /* Tx Interrupt Coalescing for ring 1 */
-#define FEC_TXIC2		0xF8  /* Tx Interrupt Coalescing for ring 2 */
-#define FEC_RXIC0		0x100 /* Rx Interrupt Coalescing for ring 0 */
-#define FEC_RXIC1		0x104 /* Rx Interrupt Coalescing for ring 1 */
-#define FEC_RXIC2		0x108 /* Rx Interrupt Coalescing for ring 2 */
+#define FEC_TXIC0		0xF0  /* Transmit Interrupt Coalescing for ring 0 */
+#define FEC_TXIC1		0xF4  /* Transmit Interrupt Coalescing for ring 1 */
+#define FEC_TXIC2		0xF8  /* Transmit Interrupt Coalescing for ring 2 */
+#define FEC_RXIC0		0x100 /* Receive Interrupt Coalescing for ring 0 */
+#define FEC_RXIC1		0x104 /* Receive Interrupt Coalescing for ring 1 */
+#define FEC_RXIC2		0x108 /* Receive Interrupt Coalescing for ring 2 */
 #define FEC_HASH_TABLE_HIGH	0x118 /* High 32bits hash table */
 #define FEC_HASH_TABLE_LOW	0x11c /* Low 32bits hash table */
 #define FEC_GRP_HASH_TABLE_HIGH	0x120 /* High 32bits hash table */
@@ -59,7 +62,7 @@
 #define FEC_R_BUFF_SIZE_2	0x174 /* Maximum receive buff ring2 size */
 #define FEC_R_DES_START_0	0x180 /* Receive descriptor ring */
 #define FEC_X_DES_START_0	0x184 /* Transmit descriptor ring */
-#define FEC_R_BUFF_SIZE_0	0x188 /* Maximum receive buff size */
+#define FEC_R_BUFF_SIZE		0x188 /* Maximum receive buff size */
 #define FEC_R_FIFO_RSFL		0x190 /* Receive FIFO section full threshold */
 #define FEC_R_FIFO_RSEM		0x194 /* Receive FIFO section empty threshold */
 #define FEC_R_FIFO_RAEM		0x198 /* Receive FIFO almost empty threshold */
@@ -67,12 +70,12 @@
 #define FEC_RACC		0x1C4 /* Receive Accelerator function */
 #define FEC_RCMR_1		0x1c8 /* Receive classification match ring 1 */
 #define FEC_RCMR_2		0x1cc /* Receive classification match ring 2 */
-#define FEC_DMA_CFG_1		0x1d8 /* DMA class configuration for ring 1 */
-#define FEC_DMA_CFG_2		0x1dc /* DMA class Configuration for ring 2 */
-#define FEC_R_DES_ACTIVE_1	0x1e0 /* Rx descriptor active for ring 1 */
-#define FEC_X_DES_ACTIVE_1	0x1e4 /* Tx descriptor active for ring 1 */
-#define FEC_R_DES_ACTIVE_2	0x1e8 /* Rx descriptor active for ring 2 */
-#define FEC_X_DES_ACTIVE_2	0x1ec /* Tx descriptor active for ring 2 */
+#define FEC_DMA_CFG_1		0x1d8 /* DMA class based configuration for ring 1 */
+#define FEC_DMA_CFG_2		0x1dc /* DMA class based Configuration for ring 2 */
+#define FEC_R_DES_ACTIVE_1	0x1e0 /* Receive descriptor active for ring 1 */
+#define FEC_X_DES_ACTIVE_1	0x1e4 /* Transmit descriptor active for ring 1 */
+#define FEC_R_DES_ACTIVE_2	0x1e8 /* Receive descriptor active for ring 2 */
+#define FEC_X_DES_ACTIVE_2	0x1ec /* Transmit descriptor active for ring 2 */
 #define FEC_QOS_SCHEME		0x1f0 /* Set multi queues Qos scheme */
 #define FEC_MIIGSK_CFGR		0x300 /* MIIGSK Configuration reg */
 #define FEC_MIIGSK_ENR		0x308 /* MIIGSK Enable reg */
@@ -142,12 +145,8 @@
 #define FEC_IEVENT		0x004 /* Interrupt even reg */
 #define FEC_IMASK		0x008 /* Interrupt mask reg */
 #define FEC_IVEC		0x00c /* Interrupt vec status reg */
-#define FEC_R_DES_ACTIVE_0	0x010 /* Receive descriptor reg */
-#define FEC_R_DES_ACTIVE_1	FEC_R_DES_ACTIVE_0
-#define FEC_R_DES_ACTIVE_2	FEC_R_DES_ACTIVE_0
-#define FEC_X_DES_ACTIVE_0	0x014 /* Transmit descriptor reg */
-#define FEC_X_DES_ACTIVE_1	FEC_X_DES_ACTIVE_0
-#define FEC_X_DES_ACTIVE_2	FEC_X_DES_ACTIVE_0
+#define FEC_R_DES_ACTIVE	0x010 /* Receive descriptor reg */
+#define FEC_X_DES_ACTIVE	0x014 /* Transmit descriptor reg */
 #define FEC_MII_DATA		0x040 /* MII manage frame reg */
 #define FEC_MII_SPEED		0x044 /* MII speed control reg */
 #define FEC_R_BOUND		0x08c /* FIFO receive bound reg */
@@ -161,29 +160,11 @@
 #define FEC_ADDR_HIGH		0x3c4 /* High 16bits MAC address */
 #define FEC_GRP_HASH_TABLE_HIGH	0x3c8 /* High 32bits hash table */
 #define FEC_GRP_HASH_TABLE_LOW	0x3cc /* Low 32bits hash table */
-#define FEC_R_DES_START_0	0x3d0 /* Receive descriptor ring */
-#define FEC_R_DES_START_1	FEC_R_DES_START_0
-#define FEC_R_DES_START_2	FEC_R_DES_START_0
-#define FEC_X_DES_START_0	0x3d4 /* Transmit descriptor ring */
-#define FEC_X_DES_START_1	FEC_X_DES_START_0
-#define FEC_X_DES_START_2	FEC_X_DES_START_0
-#define FEC_R_BUFF_SIZE_0	0x3d8 /* Maximum receive buff size */
-#define FEC_R_BUFF_SIZE_1	FEC_R_BUFF_SIZE_0
-#define FEC_R_BUFF_SIZE_2	FEC_R_BUFF_SIZE_0
+#define FEC_R_DES_START		0x3d0 /* Receive descriptor ring */
+#define FEC_X_DES_START		0x3d4 /* Transmit descriptor ring */
+#define FEC_R_BUFF_SIZE		0x3d8 /* Maximum receive buff size */
 #define FEC_FIFO_RAM		0x400 /* FIFO RAM buffer */
-/* Not existed in real chip
- * Just for pass build.
- */
-#define FEC_RCMR_1		0xFFF
-#define FEC_RCMR_2		0xFFF
-#define FEC_DMA_CFG_1		0xFFF
-#define FEC_DMA_CFG_2		0xFFF
-#define FEC_TXIC0		0xFFF
-#define FEC_TXIC1		0xFFF
-#define FEC_TXIC2		0xFFF
-#define FEC_RXIC0		0xFFF
-#define FEC_RXIC1		0xFFF
-#define FEC_RXIC2		0xFFF
+
 #endif /* CONFIG_M5272 */
 
 
@@ -272,50 +253,22 @@ struct bufdesc_ex {
 #define BD_ENET_TX_PINS         0x10000000
 #define BD_ENET_TX_IINS         0x08000000
 
+#if defined(CONFIG_ARM)
+#define FEC_ALIGNMENT   0x3f
+#else
+#define FEC_ALIGNMENT   0x3
+#endif
 
 /* This device has up to three irqs on some platforms */
 #define FEC_IRQ_NUM		3
 
-/* Maximum number of queues supported
+/*
+ * Maximum number of queues supported
  * ENET with AVB IP can support up to 3 independent tx queues and rx queues.
  * User can point the queue number that is less than or equal to 3.
  */
 #define FEC_ENET_MAX_TX_QS	3
 #define FEC_ENET_MAX_RX_QS	3
-
-#define FEC_R_DES_START(X)	((X == 1) ? FEC_R_DES_START_1 : \
-				((X == 2) ? \
-					FEC_R_DES_START_2 : FEC_R_DES_START_0))
-#define FEC_X_DES_START(X)	((X == 1) ? FEC_X_DES_START_1 : \
-				((X == 2) ? \
-					FEC_X_DES_START_2 : FEC_X_DES_START_0))
-#define FEC_R_BUFF_SIZE(X)	(((X) == 1) ? FEC_R_BUFF_SIZE_1 : \
-				(((X) == 2) ? \
-					FEC_R_BUFF_SIZE_2 : FEC_R_BUFF_SIZE_0))
-#define FEC_R_DES_ACTIVE(X)	((X == 1) ? FEC_R_DES_ACTIVE_1 : \
-				((X == 2) ? \
-				   FEC_R_DES_ACTIVE_2 : FEC_R_DES_ACTIVE_0))
-#define FEC_X_DES_ACTIVE(X)	((X == 1) ? FEC_X_DES_ACTIVE_1 : \
-				((X == 2) ? \
-				   FEC_X_DES_ACTIVE_2 : FEC_X_DES_ACTIVE_0))
-
-#define FEC_DMA_CFG(X)		((X == 2) ? FEC_DMA_CFG_2 : FEC_DMA_CFG_1)
-
-#define DMA_CLASS_EN		(1 << 16)
-#define FEC_RCMR(X)		((X == 2) ? FEC_RCMR_2 : FEC_RCMR_1)
-#define IDLE_SLOPE_MASK		0xFFFF
-#define IDLE_SLOPE_1		0x200 /* BW fraction: 0.5 */
-#define IDLE_SLOPE_2		0x200 /* BW fraction: 0.5 */
-#define IDLE_SLOPE(X)		((X == 1) ? (IDLE_SLOPE_1 & IDLE_SLOPE_MASK) : \
-				(IDLE_SLOPE_2 & IDLE_SLOPE_MASK))
-#define RCMR_MATCHEN            (0x1 << 16)
-#define RCMR_CMP_CFG(v, n)	((v & 0x7) <<  (n << 2))
-#define RCMR_CMP_1		(RCMR_CMP_CFG(0, 0) | RCMR_CMP_CFG(1, 1) | \
-				RCMR_CMP_CFG(2, 2) | RCMR_CMP_CFG(3, 3))
-#define RCMR_CMP_2		(RCMR_CMP_CFG(4, 0) | RCMR_CMP_CFG(5, 1) | \
-				RCMR_CMP_CFG(6, 2) | RCMR_CMP_CFG(7, 3))
-#define RCMR_CMP(X)		((X == 1) ? RCMR_CMP_1 : RCMR_CMP_2)
-#define FEC_TX_BD_FTYPE(X)	((X & 0xF) << 20)
 
 /* The number of Tx and Rx buffers.  These are allocated from the page
  * pool.  The code may assume these are power of two, so it it best
@@ -324,10 +277,8 @@ struct bufdesc_ex {
  * the skbuffer directly.
  */
 
-#define FEC_ENET_RX_PAGES	256
-#define FEC_ENET_RX_FRSIZE	2048
-#define FEC_ENET_RX_FRPPG	(PAGE_SIZE / FEC_ENET_RX_FRSIZE)
-#define RX_RING_SIZE		(FEC_ENET_RX_FRPPG * FEC_ENET_RX_PAGES)
+#define FEC_ENET_RX_FRSIZE	(1522 + FEC_ALIGNMENT)
+#define RX_RING_SIZE		256
 #define FEC_ENET_TX_FRSIZE	2048
 #define FEC_ENET_TX_FRPPG	(PAGE_SIZE / FEC_ENET_TX_FRSIZE)
 #define TX_RING_SIZE		512	/* Must be power of two */
@@ -340,7 +291,9 @@ struct bufdesc_ex {
 #define FLAG_RX_CSUM_ENABLED	(BD_ENET_RX_ICE | BD_ENET_RX_PCR)
 #define FLAG_RX_CSUM_ERROR	(BD_ENET_RX_ICE | BD_ENET_RX_PCR)
 
-#define FEC0_MII_BUS_SHARE_TRUE	1
+#define FALSE                  0
+#define TRUE                   1
+#define FEC0_MII_BUS_SHARE_TRUE        1
 
 /* Interrupt events/masks. */
 #define FEC_ENET_HBERR  ((uint)0x80000000)      /* Heartbeat error */
@@ -364,10 +317,36 @@ struct bufdesc_ex {
 #define FEC_ENET_TS_TIMER       ((uint)0x00008000)
 
 #define FEC_DEFAULT_IMASK (FEC_ENET_TXF | FEC_ENET_RXF | FEC_ENET_MII | FEC_ENET_TS_TIMER)
-#define FEC_RX_DISABLED_IMASK (FEC_DEFAULT_IMASK & (~FEC_ENET_RXF))
-#define FEC_TIMER_DISABLED_IMASK (FEC_DEFAULT_IMASK & (~FEC_ENET_TS_TIMER))
+#define FEC_RX_DISABLED_IMASK (FEC_DEFAULT_IMASK & (~(FEC_ENET_RXF | FEC_ENET_TXF)))
 
 #define FEC_ENET_ETHEREN	((uint)0x00000002)
+
+/* ENET AVB related macros define */
+#define FEC_R_DES_START(X)	((X == 1) ? FEC_R_DES_START_1 : \
+				((X == 2) ? FEC_R_DES_START_2 : FEC_R_DES_START_0))
+#define FEC_X_DES_START(X)	((X == 1) ? FEC_X_DES_START_1 : \
+				((X == 2) ? FEC_X_DES_START_2 : FEC_X_DES_START_0))
+#define FEC_R_DES_ACTIVE(X)	((X == 1) ? FEC_R_DES_ACTIVE_1 : \
+				((X == 2) ? FEC_R_DES_ACTIVE_2 : FEC_R_DES_ACTIVE_0))
+#define FEC_X_DES_ACTIVE(X)	((X == 1) ? FEC_X_DES_ACTIVE_1 : \
+				((X == 2) ? FEC_X_DES_ACTIVE_2 : FEC_X_DES_ACTIVE_0))
+#define FEC_DMA_CFG(X)		((X == 2) ? FEC_DMA_CFG_2 : FEC_DMA_CFG_1)
+#define FEC_RCMR(X)		((X == 2) ? FEC_RCMR_2 : FEC_RCMR_1)
+#define FEC_MRBR(X)		((X == 2) ? FEC_R_BUFF_SIZE_2 : FEC_R_BUFF_SIZE_1)
+#define DMA_CLASS_EN		(1 << 16)
+#define IDLE_SLOPE_MASK		0xFFFF
+#define IDLE_SLOPE_1		0x200 /* BW fraction: 0.5 */
+#define IDLE_SLOPE_2		0x200 /* BW fraction: 0.5 */
+#define IDLE_SLOPE(X)		((X == 1) ? (IDLE_SLOPE_1 & IDLE_SLOPE_MASK) : \
+				(IDLE_SLOPE_2 & IDLE_SLOPE_MASK))
+#define RCMR_MATCHEN		(0x1 << 16)
+#define RCMR_CMP_CFG(v, n)	((v & 0x7) <<  (n << 2))
+#define RCMR_CMP_1		(RCMR_CMP_CFG(0, 0) | RCMR_CMP_CFG(1, 1) | \
+				RCMR_CMP_CFG(2, 2) | RCMR_CMP_CFG(3, 3))
+#define RCMR_CMP_2		(RCMR_CMP_CFG(4, 0) | RCMR_CMP_CFG(5, 1) | \
+				RCMR_CMP_CFG(6, 2) | RCMR_CMP_CFG(7, 3))
+#define RCMR_CMP(X)		((X == 1) ? RCMR_CMP_1 : RCMR_CMP_2)
+#define FEC_TX_BD_FTYPE(X)	((X & 0xF) << 20)
 
 /* ENET interrupt coalescing macro define */
 #define FEC_ITR_CLK_SEL		(0x1 << 30)
@@ -377,25 +356,73 @@ struct bufdesc_ex {
 #define FEC_ITR_ICFT_DEFAULT	200  /* Set 200 frame count threshold */
 #define FEC_ITR_ICTT_DEFAULT	1000 /* Set 1000us timer threshold */
 
-#define FEC_VLAN_TAG_LEN       0x04
-#define FEC_ETHTYPE_LEN                0x02
+/* IEEE 1588 definition */
+#define FEC_T_PERIOD_ONE_SEC           0x3B9ACA00
+
+#define DEFAULT_PTP_RX_BUF_SZ          64
+#define DEFAULT_PTP_TX_BUF_SZ          64
+
+/* 1588stack API defines */
+#define PTP_ENBL_TXTS_IOCTL    SIOCDEVPRIVATE
+#define PTP_DSBL_TXTS_IOCTL    (SIOCDEVPRIVATE + 1)
+#define PTP_ENBL_RXTS_IOCTL    (SIOCDEVPRIVATE + 2)
+#define PTP_DSBL_RXTS_IOCTL    (SIOCDEVPRIVATE + 3)
+#define PTP_GET_TX_TIMESTAMP   (SIOCDEVPRIVATE + 4)
+#define PTP_GET_RX_TIMESTAMP   (SIOCDEVPRIVATE + 5)
+#define PTP_SET_RTC_TIME       (SIOCDEVPRIVATE + 6)
+#define PTP_GET_CURRENT_TIME   (SIOCDEVPRIVATE + 7)
+#define PTP_SET_COMPENSATION   (SIOCDEVPRIVATE + 9)
+#define PTP_GET_ORIG_COMP      (SIOCDEVPRIVATE + 10)
+#define PTP_FLUSH_TIMESTAMP    (SIOCDEVPRIVATE + 11)
+
+/* IEEE1588 ptp head format */
+#define PTP_CTRL_OFFS          0x52
+#define PTP_SOURCE_PORT_LENGTH 10
+#define PTP_HEADER_SEQ_OFFS    30
+#define PTP_HEADER_CTL_OFFS    32
+#define PTP_SPID_OFFS          20
+#define PTP_HEADER_SZE         34
+#define PTP_EVENT_PORT         0x013F
+
+#define FEC_VLAN_TAG_LEN	0x04
+#define FEC_ETHTYPE_LEN		0x02
+#define ETH_P_1722		0x22f0
+
+/* 1588-2008 network protocol enumeration values */
+#define FEC_PTP_PROT_IPV4              1
+#define FEC_PTP_PROT_IPV6              2
+#define FEC_PTP_PROT_802_3             3
+#define FEC_PTP_PROT_DONTCARE          0xFFFF
+#define FEC_PACKET_TYPE_UDP            0x11
+
+#define FEC_PTP_ORIG_COMP              0x15555555
+#define FEC_PTP_SPINNER_2              2
+#define FEC_PTP_SPINNER_4              4
+#define FEC_PTP_TIMEOUT_TS		10
+#define FEC_PTP_TIMEOUT_EVENT		1000
 
 /* Controller is ENET-MAC */
-#define FEC_QUIRK_ENET_MAC		(1 << 0)
+#define FEC_QUIRK_ENET_MAC              (1 << 0)
 /* Controller needs driver to swap frame */
-#define FEC_QUIRK_SWAP_FRAME		(1 << 1)
+#define FEC_QUIRK_SWAP_FRAME            (1 << 1)
 /* Controller uses gasket */
-#define FEC_QUIRK_USE_GASKET		(1 << 2)
+#define FEC_QUIRK_USE_GASKET            (1 << 2)
 /* Controller has GBIT support */
-#define FEC_QUIRK_HAS_GBIT		(1 << 3)
+#define FEC_QUIRK_HAS_GBIT              (1 << 3)
 /* Controller has extend desc buffer */
-#define FEC_QUIRK_HAS_BUFDESC_EX	(1 << 4)
+#define FEC_QUIRK_HAS_BUFDESC_EX        (1 << 4)
 /* Controller has hardware checksum support */
-#define FEC_QUIRK_HAS_CSUM		(1 << 5)
+#define FEC_QUIRK_HAS_CSUM              (1 << 5)
 /* Controller has hardware vlan support */
-#define FEC_QUIRK_HAS_VLAN		(1 << 6)
+#define FEC_QUIRK_HAS_VLAN              (1 << 6)
+/* Controller is FEC-MAC */
+#define FEC_QUIRK_FEC_MAC              (1 << 7)
 /* ENET IP errata ERR006358
  *
+ * If the ready bit in the transmit buffer descriptor (TxBD[R]) is previously
+ * detected as not set during a prior frame transmission, then the
+ * ENET_TDAR[TDAR] bit is cleared at a later time, even if additional TxBDs
+ * were added to the ring and the ENET_TDAR[TDAR] bit is set. This results in
  * If the ready bit in the transmit buffer descriptor (TxBD[R]) is previously
  * detected as not set during a prior frame transmission, then the
  * ENET_TDAR[TDAR] bit is cleared at a later time, even if additional TxBDs
@@ -403,41 +430,89 @@ struct bufdesc_ex {
  * frames not being transmitted until there is a 0-to-1 transition on
  * ENET_TDAR[TDAR].
  */
-#define FEC_QUIRK_ERR006358            (1 << 7)
-/* ENET IP hw AVB
- *
+#define FEC_QUIRK_ERR006358            (1 << 8)
+/*
+ * i.MX6Q/DL ENET cannot wake up system in wait mode because ENET tx & rx
+ * interrupt signal don't connect to GPC. So use pm qos to avoid cpu enter
+ * to wait mode.
+ */
+#define FEC_QUIRK_BUG_WAITMODE          (1 << 9)
+/*
  * i.MX6SX ENET IP add Audio Video Bridging (AVB) feature support.
+ * ENET IP hw AVB main function:
  * - Two class indicators on receive with configurable priority
  * - Two class indicators and line speed timer on transmit allowing
  *   implementation class credit based shapers externally
  * - Additional DMA registers provisioned to allow managing up to 3
  *   independent rings
  */
-#define FEC_QUIRK_HAS_AVB		(1 << 8)
+#define FEC_QUIRK_HAS_AVB               (1 << 10)
 /*
- * i.MX6Q/DL ENET cannot wake up system in wait mode because ENET tx & rx
- * interrupt signal don't connect to GPC. So use pm qos to avoid cpu enter
- * to wait mode.
- */
-#define FEC_QUIRK_BUG_WAITMODE		(1 << 9)
-/* There is a TDAR race condition for mutliQ when the software sets TDAR
+ * There is a TDAR race condition for mutliQ when the software sets TDAR
  * and the UDMA clears TDAR simultaneously or in a small window (2-4 cycles).
  * This will cause the udma_tx and udma_tx_arbiter state machines to hang.
  * The issue exist at i.MX6SX enet IP.
  */
-#define FEC_QUIRK_ERR007885		(1 << 10)
+#define FEC_QUIRK_TKT210582             (1 << 11)
 /*
  * Incorrect behavior for ENET_ATCR[Capture and Restart Bits].
  * These bits will always read a value zero. According to SPEC, when these
  * bits are set to 1'b1, these should hold value 1'b1 until the counter value
  * is capture in the register clock domain.
  */
-#define FEC_QUIRK_TKT210590             (1 << 11)
+#define FEC_QUIRK_TKT210590             (1 << 12)
 
-struct fec_enet_stop_mode {
-	struct regmap *gpr;
-	u8 req_gpr;
-	u8 req_bit;
+/* PTP standard time representation structure */
+struct ptp_time{
+	u64 sec;        /* seconds */
+	u32 nsec;       /* nanoseconds */
+};
+
+/* struct needed to identify a timestamp */
+struct fec_ptp_ident {
+	u8      version;
+	u8      message_type;
+	u16     netw_prot;
+	u16     seq_id;
+	u8      spid[10];
+};
+
+/* interface for PTP driver command GET_TX_TIME */
+struct fec_ptp_ts_data {
+	struct fec_ptp_ident ident;
+	/* PTP timestamp */
+	struct ptp_time ts;
+};
+
+/* circular buffer for ptp timestamps over ioctl */
+struct fec_ptp_circular {
+	int     front;
+	int     end;
+	int     size;
+	struct  fec_ptp_ts_data *data_buf;
+};
+
+/* interface for PTP driver command SET_RTC_TIME/GET_CURRENT_TIME */
+struct ptp_rtc_time {
+	struct ptp_time rtc_time;
+};
+
+/* interface for PTP driver command SET_COMPENSATION */
+struct ptp_set_comp {
+	u32 drift;
+	bool o_ops;
+	u32 freq_compensation;
+};
+
+struct ptp_time_correct {
+	u32 corr_period;
+	u32 corr_inc;
+};
+
+struct fec_enet_delayed_work {
+	struct delayed_work delay_work;
+	bool timeout;
+	int trig_tx;
 };
 
 struct fec_enet_priv_tx_q {
@@ -449,11 +524,12 @@ struct fec_enet_priv_tx_q {
 	struct bufdesc	*tx_bd_base;
 	uint tx_ring_size;
 
-	unsigned short tx_stop_threshold;
-	unsigned short tx_wake_threshold;
-
 	struct bufdesc	*cur_tx;
 	struct bufdesc	*dirty_tx;
+
+	/* Software TSO */
+	unsigned short tx_stop_threshold;
+	unsigned short tx_wake_threshold;
 	char *tso_hdrs;
 	dma_addr_t tso_hdrs_dma;
 };
@@ -489,15 +565,14 @@ struct fec_enet_private {
 	struct clk *clk_enet_out;
 	struct clk *clk_ptp;
 
-	bool ptp_clk_on;
-	struct mutex ptp_clk_mutex;
-	unsigned int num_tx_queues;
-	unsigned int num_rx_queues;
+	int num_tx_queues;
+	int num_rx_queues;
 
 	/* The saved address of a sent-in-place packet/buffer, for skfree(). */
 	struct fec_enet_priv_tx_q *tx_queue[FEC_ENET_MAX_TX_QS];
 	struct fec_enet_priv_rx_q *rx_queue[FEC_ENET_MAX_RX_QS];
 
+	unsigned short bufdesc_size;
 	unsigned int total_tx_ring_size;
 	unsigned int total_rx_ring_size;
 
@@ -506,10 +581,9 @@ struct fec_enet_private {
 	unsigned long work_ts;
 	unsigned long work_mdio;
 
-	unsigned short bufdesc_size;
-
 	struct	platform_device *pdev;
 
+	int	opened;
 	int	dev_id;
 
 	/* Phylib and MDIO interface */
@@ -517,25 +591,29 @@ struct fec_enet_private {
 	struct	phy_device *phy_dev;
 	int	mii_timeout;
 	int	mii_bus_share;
-	bool	miibus_up_failed;
 	uint	phy_speed;
+	uint	phy_id;
 	phy_interface_t	phy_interface;
-	struct device_node *phy_node;
 	int	link;
 	int	full_duplex;
 	int	speed;
 	struct	completion mdio_done;
 	int	irq[FEC_IRQ_NUM];
-	bool	bufdesc_ex;
+	/* HW timestamping over ioctl enabled flag */
+	int hwts_tx_en_ioctl;
+	int hwts_rx_en_ioctl;
+	struct fec_ptp_circular tx_timestamps;
+	struct fec_ptp_circular rx_timestamps;
+	u64 prtc;
+	int	bufdesc_ex;
 	int	pause_flag;
 	int	wol_flag;
-	int	wake_irq;
-	u32	quirks;
 
 	struct	napi_struct napi;
 	int	csum_flags;
 
-	struct work_struct tx_timeout_work;
+	int     phy_reset_gpio;
+	int     reset_duration;
 
 	struct ptp_clock *ptp_clock;
 	struct ptp_clock_info ptp_caps;
@@ -548,38 +626,30 @@ struct fec_enet_private {
 	u32 cycle_speed;
 	int hwts_rx_en;
 	int hwts_tx_en;
-	struct delayed_work time_keep;
+	struct timer_list time_keep;
+	struct fec_enet_delayed_work delay_work;
 	struct regulator *reg_phy;
 
-	unsigned int tx_align;
-	unsigned int rx_align;
-
 	/* hw interrupt coalesce */
-	unsigned int rx_pkts_itr;
-	unsigned int rx_time_itr;
-	unsigned int tx_pkts_itr;
-	unsigned int tx_time_itr;
+	uint rx_pkts_itr;
+	uint rx_time_itr;
+	uint tx_pkts_itr;
+	uint tx_time_itr;
 	unsigned int itr_clk_rate;
-
-	u32 rx_copybreak;
-
-	/* ptp clock period in ns*/
-	unsigned int ptp_inc;
-
-	/* pps  */
-	int pps_channel;
-	unsigned int reload_period;
-	int pps_enable;
-	unsigned int next_counter;
-
-	struct fec_enet_stop_mode gpr;
 };
 
 void fec_ptp_init(struct platform_device *pdev);
 void fec_ptp_start_cyclecounter(struct net_device *ndev);
-int fec_ptp_set(struct net_device *ndev, struct ifreq *ifr);
-int fec_ptp_get(struct net_device *ndev, struct ifreq *ifr);
-uint fec_ptp_check_pps_event(struct fec_enet_private *fep);
+int fec_ptp_ioctl(struct net_device *ndev, struct ifreq *ifr, int cmd);
+void fec_ptp_cleanup(struct fec_enet_private *priv);
+void fec_ptp_stop(struct net_device *ndev);
+int fec_ptp_do_txstamp(struct sk_buff *skb);
+void fec_ptp_store_txstamp(struct fec_enet_private *priv,
+				struct sk_buff *skb,
+				struct bufdesc *bdp);
+void fec_ptp_store_rxstamp(struct fec_enet_private *priv,
+				struct sk_buff *skb,
+				struct bufdesc *bdp);
 
 /****************************************************************************/
 #endif /* FEC_H */

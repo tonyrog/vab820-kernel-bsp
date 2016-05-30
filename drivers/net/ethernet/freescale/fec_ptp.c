@@ -28,6 +28,7 @@
 #include <linux/slab.h>
 #include <linux/interrupt.h>
 #include <linux/pci.h>
+#include <linux/init.h>
 #include <linux/delay.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
@@ -36,6 +37,9 @@
 #include <linux/workqueue.h>
 #include <linux/bitops.h>
 #include <linux/io.h>
+#include <linux/vmalloc.h>
+#include <linux/ip.h>
+#include <linux/udp.h>
 #include <linux/irq.h>
 #include <linux/clk.h>
 #include <linux/platform_device.h>
@@ -47,6 +51,7 @@
 #include <linux/of_net.h>
 
 #include "fec.h"
+
 
 /* FEC 1588 register bits */
 #define FEC_T_CTRL_SLAVE                0x00002000
@@ -61,24 +66,6 @@
 #define FEC_T_INC_CORR_MASK             0x00007f00
 #define FEC_T_INC_CORR_OFFSET           8
 
-#define FEC_T_CTRL_PINPER		0x00000080
-#define FEC_T_TF0_MASK			0x00000001
-#define FEC_T_TF0_OFFSET		0
-#define FEC_T_TF1_MASK			0x00000002
-#define FEC_T_TF1_OFFSET		1
-#define FEC_T_TF2_MASK			0x00000004
-#define FEC_T_TF2_OFFSET		2
-#define FEC_T_TF3_MASK			0x00000008
-#define FEC_T_TF3_OFFSET		3
-#define FEC_T_TDRE_MASK			0x00000001
-#define FEC_T_TDRE_OFFSET		0
-#define FEC_T_TMODE_MASK		0x0000003C
-#define FEC_T_TMODE_OFFSET		2
-#define FEC_T_TIE_MASK			0x00000040
-#define FEC_T_TIE_OFFSET		6
-#define FEC_T_TF_MASK			0x00000080
-#define FEC_T_TF_OFFSET			7
-
 #define FEC_ATIME_CTRL		0x400
 #define FEC_ATIME		0x404
 #define FEC_ATIME_EVT_OFFSET	0x408
@@ -87,141 +74,460 @@
 #define FEC_ATIME_INC		0x414
 #define FEC_TS_TIMESTAMP	0x418
 
-#define FEC_TGSR		0x604
-#define FEC_TCSR(n)		(0x608 + n * 0x08)
-#define FEC_TCCR(n)		(0x60C + n * 0x08)
-#define MAX_TIMER_CHANNEL	3
-#define FEC_TMODE_TOGGLE	0x05
-#define FEC_HIGH_PULSE		0x0F
-
 #define FEC_CC_MULT	(1 << 31)
-#define FEC_COUNTER_PERIOD	(1 << 31)
-#define PPS_OUPUT_RELOAD_PERIOD	NSEC_PER_SEC
-#define FEC_CHANNLE_0		0
-#define DEFAULT_PPS_CHANNEL	FEC_CHANNLE_0
 
-/**
- * fec_ptp_enable_pps
- * @fep: the fec_enet_private structure handle
- * @enable: enable the channel pps output
- *
- * This function enble the PPS ouput on the timer channel.
- */
-static int fec_ptp_enable_pps(struct fec_enet_private *fep, uint enable)
+/* Alloc the ring resource */
+static int fec_ptp_init_circ(struct fec_ptp_circular *buf, int size)
 {
-	unsigned long flags;
-	u32 val, tempval;
-	int inc;
-	struct timespec ts;
-	u64 ns;
-	u32 remainder;
-	val = 0;
+	buf->data_buf = (struct fec_ptp_ts_data *)
+		vmalloc(size * sizeof(struct fec_ptp_ts_data));
 
-	if (!(fep->hwts_tx_en || fep->hwts_rx_en)) {
-		dev_err(&fep->pdev->dev, "No ptp stack is running\n");
-		return -EINVAL;
-	}
+	if (!buf->data_buf)
+		return 1;
+	buf->front = 0;
+	buf->end = 0;
+	buf->size = size;
+	return 0;
+}
 
-	if (fep->pps_enable == enable)
+static inline int fec_ptp_calc_index(int size, int curr_index, int offset)
+{
+	return (curr_index + offset) % size;
+}
+
+static int fec_ptp_is_empty(struct fec_ptp_circular *buf)
+{
+	return (buf->front == buf->end);
+}
+
+static int fec_ptp_nelems(struct fec_ptp_circular *buf)
+{
+	const int front = buf->front;
+	const int end = buf->end;
+	const int size = buf->size;
+	int n_items;
+
+	if (end > front)
+		n_items = end - front;
+	else if (end < front)
+		n_items = size - (front - end);
+	else
+		n_items = 0;
+
+	return n_items;
+}
+
+static int fec_ptp_is_full(struct fec_ptp_circular *buf)
+{
+	if (fec_ptp_nelems(buf) == (buf->size - 1))
+		return 1;
+	else
 		return 0;
+}
 
-	fep->pps_channel = DEFAULT_PPS_CHANNEL;
-	fep->reload_period = PPS_OUPUT_RELOAD_PERIOD;
-	inc = fep->ptp_inc;
+static int fec_ptp_insert(struct fec_ptp_circular *ptp_buf,
+			  struct fec_ptp_ts_data *data)
+{
+	struct fec_ptp_ts_data *tmp;
 
-	spin_lock_irqsave(&fep->tmreg_lock, flags);
-
-	if (enable) {
-		/* clear capture or output compare interrupt status if have.
-		 */
-		writel(FEC_T_TF_MASK, fep->hwp + FEC_TCSR(fep->pps_channel));
-
-		/* It is recommended to doulbe check the TMODE field in the
-		 * TCSR register to be cleared before the first compare counter
-		 * is written into TCCR register. Just add a double check.
-		 */
-		val = readl(fep->hwp + FEC_TCSR(fep->pps_channel));
-		do {
-			val &= ~(FEC_T_TMODE_MASK);
-			writel(val, fep->hwp + FEC_TCSR(fep->pps_channel));
-			val = readl(fep->hwp + FEC_TCSR(fep->pps_channel));
-		} while (val & FEC_T_TMODE_MASK);
-
-		/* Dummy read counter to update the counter */
-		timecounter_read(&fep->tc);
-		/* We want to find the first compare event in the next
-		 * second point. So we need to know what the ptp time
-		 * is now and how many nanoseconds is ahead to get next second.
-		 * The remaining nanosecond ahead before the next second would be
-		 * NSEC_PER_SEC - ts.tv_nsec. Add the remaining nanoseconds
-		 * to current timer would be next second.
-		 */
-		tempval = readl(fep->hwp + FEC_ATIME_CTRL);
-		tempval |= FEC_T_CTRL_CAPTURE;
-		writel(tempval, fep->hwp + FEC_ATIME_CTRL);
-
-		tempval = readl(fep->hwp + FEC_ATIME);
-		/* Convert the ptp local counter to 1588 timestamp */
-		ns = timecounter_cyc2time(&fep->tc, tempval);
-		ts.tv_sec = div_u64_rem(ns, 1000000000ULL, &remainder);
-		ts.tv_nsec = remainder;
-
-		/* The tempval is  less than 3 seconds, and  so val is less than
-		 * 4 seconds. No overflow for 32bit calculation.
-		 */
-		val = NSEC_PER_SEC - (u32)ts.tv_nsec + tempval;
-
-		/* Need to consider the situation that the current time is
-		 * very close to the second point, which means NSEC_PER_SEC
-		 * - ts.tv_nsec is close to be zero(For example 20ns); Since the timer
-		 * is still running when we calculate the first compare event, it is
-		 * possible that the remaining nanoseonds run out before the compare
-		 * counter is calculated and written into TCCR register. To avoid
-		 * this possibility, we will set the compare event to be the next
-		 * of next second. The current setting is 31-bit timer and wrap
-		 * around over 2 seconds. So it is okay to set the next of next
-		 * seond for the timer.
-		 */
-		val += NSEC_PER_SEC;
-
-		/* We add (2 * NSEC_PER_SEC - (u32)ts.tv_nsec) to current
-		 * ptp counter, which maybe cause 32-bit wrap. Since the
-		 * (NSEC_PER_SEC - (u32)ts.tv_nsec) is less than 2 second.
-		 * We can ensure the wrap will not cause issue. If the offset
-		 * is bigger than fep->cc.mask would be a error.
-		 */
-		val &= fep->cc.mask;
-		writel(val, fep->hwp + FEC_TCCR(fep->pps_channel));
-
-		/* Calculate the second the compare event timestamp */
-		fep->next_counter = (val + fep->reload_period) & fep->cc.mask;
-
-		/* * Enable compare event when overflow */
-		val = readl(fep->hwp + FEC_ATIME_CTRL);
-		val |= FEC_T_CTRL_PINPER;
-		writel(val, fep->hwp + FEC_ATIME_CTRL);
-
-		/* Compare channel setting. */
-		val = readl(fep->hwp + FEC_TCSR(fep->pps_channel));
-		val |= (1 << FEC_T_TF_OFFSET | 1 << FEC_T_TIE_OFFSET);
-		val &= ~(1 << FEC_T_TDRE_OFFSET);
-		val &= ~(FEC_T_TMODE_MASK);
-		val |= (FEC_HIGH_PULSE << FEC_T_TMODE_OFFSET);
-		writel(val, fep->hwp + FEC_TCSR(fep->pps_channel));
-
-		/* Write the second compare event timestamp and calculate
-		 * the third timestamp. Refer the TCCR register detail in the spec.
-		 */
-		writel(fep->next_counter, fep->hwp + FEC_TCCR(fep->pps_channel));
-		fep->next_counter = (fep->next_counter + fep->reload_period) & fep->cc.mask;
-	} else {
-		writel(0, fep->hwp + FEC_TCSR(fep->pps_channel));
-	}
-
-	fep->pps_enable = enable;
-	spin_unlock_irqrestore(&fep->tmreg_lock, flags);
+	tmp = (ptp_buf->data_buf + ptp_buf->end);
+	memcpy(tmp, data, sizeof(struct fec_ptp_ts_data));
+	if (fec_ptp_is_full(ptp_buf))
+		/* drop one in front */
+		ptp_buf->front =
+			fec_ptp_calc_index(ptp_buf->size, ptp_buf->front, 1);
+	ptp_buf->end = fec_ptp_calc_index(ptp_buf->size, ptp_buf->end, 1);
 
 	return 0;
+}
+
+static int fec_ptp_find_and_remove(struct fec_ptp_circular *ptp_buf,
+			struct fec_ptp_ident *ident, struct ptp_time *ts)
+{
+	int i;
+	int size = ptp_buf->size, end = ptp_buf->end;
+	struct fec_ptp_ident *tmp_ident;
+
+	if (fec_ptp_is_empty(ptp_buf))
+		return 1;
+
+	i = ptp_buf->front;
+	while (i != end) {
+		tmp_ident = &(ptp_buf->data_buf + i)->ident;
+		if (tmp_ident->version == ident->version) {
+			if (tmp_ident->message_type == ident->message_type) {
+				if ((tmp_ident->netw_prot == ident->netw_prot)
+				|| (ident->netw_prot ==
+					FEC_PTP_PROT_DONTCARE)) {
+					if (tmp_ident->seq_id ==
+							ident->seq_id) {
+						int ret =
+						memcmp(tmp_ident->spid,
+							ident->spid,
+							PTP_SOURCE_PORT_LENGTH);
+						if (0 == ret)
+							break;
+					}
+				}
+			}
+		}
+		/* get next */
+		i = fec_ptp_calc_index(size, i, 1);
+	}
+
+	/* not found ? */
+	if (i == end) {
+		/* buffer full ? */
+		if (fec_ptp_is_full(ptp_buf))
+			/* drop one in front */
+			ptp_buf->front =
+			fec_ptp_calc_index(size, ptp_buf->front, 1);
+
+		return 1;
+	}
+	*ts = (ptp_buf->data_buf + i)->ts;
+
+	return 0;
+}
+
+/* 1588 Module intialization */
+void fec_ptp_start(struct net_device *ndev)
+{
+	struct fec_enet_private *fep = netdev_priv(ndev);
+	unsigned long flags;
+	int inc;
+
+	inc = FEC_T_PERIOD_ONE_SEC / clk_get_rate(fep->clk_ptp);
+
+	spin_lock_irqsave(&fep->tmreg_lock, flags);
+	/* Select 1588 Timer source and enable module for starting Tmr Clock */
+	writel(FEC_T_CTRL_RESTART, fep->hwp + FEC_ATIME_CTRL);
+	writel(inc << FEC_T_INC_OFFSET,
+			fep->hwp + FEC_ATIME_INC);
+	writel(FEC_T_PERIOD_ONE_SEC, fep->hwp + FEC_ATIME_EVT_PERIOD);
+	/* start counter */
+	writel(FEC_T_CTRL_PERIOD_RST | FEC_T_CTRL_ENABLE,
+			fep->hwp + FEC_ATIME_CTRL);
+	spin_unlock_irqrestore(&fep->tmreg_lock, flags);
+}
+
+/* Cleanup routine for 1588 module.
+ * When PTP is disabled this routing is called */
+void fec_ptp_stop(struct net_device *ndev)
+{
+	struct fec_enet_private *priv = netdev_priv(ndev);
+
+	writel(0, priv->hwp + FEC_ATIME_CTRL);
+	writel(FEC_T_CTRL_RESTART, priv->hwp + FEC_ATIME_CTRL);
+
+	del_timer_sync(&priv->time_keep);
+}
+
+static void fec_get_curr_cnt(struct fec_enet_private *priv,
+			struct ptp_rtc_time *curr_time)
+{
+	u32 tempval, old_sec;
+	u32 timeout_event, timeout_ts = 0;
+	const struct platform_device_id *id_entry =
+			platform_get_device_id(priv->pdev);
+
+	do {
+		old_sec = priv->prtc;
+		timeout_event = 0;
+
+		tempval = readl(priv->hwp + FEC_ATIME_CTRL);
+		tempval |= FEC_T_CTRL_CAPTURE;
+		writel(tempval, priv->hwp + FEC_ATIME_CTRL);
+		if (id_entry->driver_data & FEC_QUIRK_TKT210590)
+			udelay(1);
+		curr_time->rtc_time.nsec = readl(priv->hwp + FEC_ATIME);
+
+		while (readl(priv->hwp + FEC_IEVENT) & FEC_ENET_TS_TIMER) {
+			timeout_event++;
+			udelay(20);
+
+			if (timeout_event >= FEC_PTP_TIMEOUT_EVENT)
+				break;
+		}
+
+		curr_time->rtc_time.sec = priv->prtc;
+		timeout_ts++;
+
+		if (timeout_event >= FEC_PTP_TIMEOUT_EVENT)
+			pr_err("timeout: TS TIMER event\n");
+
+	} while (old_sec != curr_time->rtc_time.sec &&
+		 timeout_ts < FEC_PTP_TIMEOUT_TS);
+
+	if (timeout_ts >= FEC_PTP_TIMEOUT_TS)
+		pr_err("timeout: current timestamp unmatched\n");
+}
+
+/* Set the 1588 timer counter registers */
+static void fec_set_1588cnt(struct fec_enet_private *priv,
+			struct ptp_rtc_time *fec_time)
+{
+	u32 tempval;
+	unsigned long flags;
+
+	spin_lock_irqsave(&priv->tmreg_lock, flags);
+	priv->prtc = fec_time->rtc_time.sec;
+
+	tempval = fec_time->rtc_time.nsec;
+	writel(tempval, priv->hwp + FEC_ATIME);
+	spin_unlock_irqrestore(&priv->tmreg_lock, flags);
+}
+
+/**
+ * Parse packets if they are PTP.
+ * The PTP header can be found in an IPv4, IPv6 or in an IEEE802.3
+ * ethernet frame. The function returns the position of the PTP packet
+ * or NULL, if no PTP found
+ */
+u8 *fec_ptp_parse_packet(struct sk_buff *skb, u16 *eth_type)
+{
+	u8 *position = skb->data + ETH_ALEN + ETH_ALEN;
+	u8 *ptp_loc = NULL;
+
+	*eth_type = *((u16 *)position);
+	/* Check if outer vlan tag is here */
+	if (ntohs(*eth_type) == ETH_P_8021Q) {
+		position += FEC_VLAN_TAG_LEN;
+		*eth_type = *((u16 *)position);
+	}
+
+	/* set position after ethertype */
+	position += FEC_ETHTYPE_LEN;
+	if (ETH_P_1588 == ntohs(*eth_type)) {
+		ptp_loc = position;
+		/* IEEE1588 event message which needs timestamping */
+		if ((ptp_loc[0] & 0xF) <= 3) {
+			if (skb->len >=
+			((ptp_loc - skb->data) + PTP_HEADER_SZE))
+				return ptp_loc;
+		}
+	} else if (ETH_P_IP == ntohs(*eth_type)) {
+		u8 *ip_header, *prot, *udp_header;
+		u8 ip_version, ip_hlen;
+		ip_header = position;
+		ip_version = ip_header[0] >> 4; /* correct IP version? */
+		if (0x04 == ip_version) { /* IPv4 */
+			prot = ip_header + 9; /* protocol */
+			if (FEC_PACKET_TYPE_UDP == *prot) {
+				u16 udp_dstPort;
+				/* retrieve the size of the ip-header
+				 * with the first byte of the ip-header:
+				 * version ( 4 bits) + Internet header
+				 * length (4 bits)
+				 */
+				ip_hlen   = (*ip_header & 0xf) * 4;
+				udp_header = ip_header + ip_hlen;
+				udp_dstPort = *((u16 *)(udp_header + 2));
+				/* check the destination port address
+				 * ( 319 (0x013F) = PTP event port )
+				 */
+				if (ntohs(udp_dstPort) == PTP_EVENT_PORT) {
+					ptp_loc = udp_header + 8;
+					/* long enough ? */
+					if (skb->len >= ((ptp_loc - skb->data)
+							+ PTP_HEADER_SZE))
+						return ptp_loc;
+				}
+			}
+		}
+	} else if (ETH_P_IPV6 == ntohs(*eth_type)) {
+		u8 *ip_header, *udp_header, *prot;
+		u8 ip_version;
+		ip_header = position;
+		ip_version = ip_header[0] >> 4;
+		if (0x06 == ip_version) {
+			prot = ip_header + 6;
+			if (FEC_PACKET_TYPE_UDP == *prot) {
+				u16 udp_dstPort;
+				udp_header = ip_header + 40;
+				udp_dstPort = *((u16 *)(udp_header + 2));
+				/* check the destination port address
+				 * ( 319 (0x013F) = PTP event port )
+				 */
+				if (ntohs(udp_dstPort) == PTP_EVENT_PORT) {
+					ptp_loc = udp_header + 8;
+					/* long enough ? */
+					if (skb->len >= ((ptp_loc - skb->data)
+							+ PTP_HEADER_SZE))
+						return ptp_loc;
+				}
+			}
+		}
+	}
+
+	return NULL; /* no PTP frame */
+}
+
+/* Set the BD to ptp */
+int fec_ptp_do_txstamp(struct sk_buff *skb)
+{
+	u8 *ptp_loc;
+	u16 eth_type;
+
+	ptp_loc = fec_ptp_parse_packet(skb, &eth_type);
+	if (ptp_loc != NULL)
+		return 1;
+
+	return 0;
+}
+
+void fec_ptp_store_txstamp(struct fec_enet_private *priv,
+			   struct sk_buff *skb,
+			   struct bufdesc *bdp)
+{
+	struct fec_ptp_ts_data tmp_tx_time;
+	struct bufdesc_ex *bdp_ex = NULL;
+	struct ptp_rtc_time curr_time;
+	u8 *ptp_loc;
+	u16 eth_type;
+
+	bdp_ex = container_of(bdp, struct bufdesc_ex, desc);
+	ptp_loc = fec_ptp_parse_packet(skb, &eth_type);
+	if (ptp_loc != NULL) {
+		/* store identification data */
+		switch (ntohs(eth_type)) {
+		case ETH_P_IP:
+			tmp_tx_time.ident.netw_prot = FEC_PTP_PROT_IPV4;
+			break;
+		case ETH_P_IPV6:
+			tmp_tx_time.ident.netw_prot = FEC_PTP_PROT_IPV6;
+			break;
+		case ETH_P_1588:
+			tmp_tx_time.ident.netw_prot = FEC_PTP_PROT_802_3;
+			break;
+		default:
+			return;
+		}
+		tmp_tx_time.ident.version = (*(ptp_loc + 1)) & 0X0F;
+		tmp_tx_time.ident.message_type = (*(ptp_loc)) & 0x0F;
+		tmp_tx_time.ident.seq_id =
+			ntohs(*((u16 *)(ptp_loc + PTP_HEADER_SEQ_OFFS)));
+		memcpy(tmp_tx_time.ident.spid, &ptp_loc[PTP_SPID_OFFS],
+						PTP_SOURCE_PORT_LENGTH);
+		/* store tx timestamp */
+		fec_get_curr_cnt(priv, &curr_time);
+		if (curr_time.rtc_time.nsec < bdp_ex->ts)
+			tmp_tx_time.ts.sec = curr_time.rtc_time.sec - 1;
+		else
+			tmp_tx_time.ts.sec = curr_time.rtc_time.sec;
+		tmp_tx_time.ts.nsec = bdp_ex->ts;
+		/* insert timestamp in circular buffer */
+		fec_ptp_insert(&(priv->tx_timestamps), &tmp_tx_time);
+	}
+}
+
+void fec_ptp_store_rxstamp(struct fec_enet_private *priv,
+			   struct sk_buff *skb,
+			   struct bufdesc *bdp)
+{
+	struct fec_ptp_ts_data tmp_rx_time;
+	struct bufdesc_ex *bdp_ex = NULL;
+	struct ptp_rtc_time curr_time;
+	u8 *ptp_loc;
+	u16 eth_type;
+
+	bdp_ex = container_of(bdp, struct bufdesc_ex, desc);
+	ptp_loc = fec_ptp_parse_packet(skb, &eth_type);
+	if (ptp_loc != NULL) {
+		/* store identification data */
+		tmp_rx_time.ident.version = (*(ptp_loc + 1)) & 0X0F;
+		tmp_rx_time.ident.message_type = (*(ptp_loc)) & 0x0F;
+		switch (ntohs(eth_type)) {
+		case ETH_P_IP:
+			tmp_rx_time.ident.netw_prot = FEC_PTP_PROT_IPV4;
+			break;
+		case ETH_P_IPV6:
+			tmp_rx_time.ident.netw_prot = FEC_PTP_PROT_IPV6;
+			break;
+		case ETH_P_1588:
+			tmp_rx_time.ident.netw_prot = FEC_PTP_PROT_802_3;
+			break;
+		default:
+			return;
+		}
+		tmp_rx_time.ident.seq_id =
+			ntohs(*((u16 *)(ptp_loc + PTP_HEADER_SEQ_OFFS)));
+		memcpy(tmp_rx_time.ident.spid, &ptp_loc[PTP_SPID_OFFS],
+						PTP_SOURCE_PORT_LENGTH);
+		/* store rx timestamp */
+		fec_get_curr_cnt(priv, &curr_time);
+		if (curr_time.rtc_time.nsec < bdp_ex->ts)
+			tmp_rx_time.ts.sec = curr_time.rtc_time.sec - 1;
+		else
+			tmp_rx_time.ts.sec = curr_time.rtc_time.sec;
+		tmp_rx_time.ts.nsec = bdp_ex->ts;
+
+		/* insert timestamp in circular buffer */
+		fec_ptp_insert(&(priv->rx_timestamps), &tmp_rx_time);
+	}
+}
+
+
+static void fec_handle_ptpdrift(struct fec_enet_private *priv,
+	struct ptp_set_comp *comp, struct ptp_time_correct *ptc)
+{
+	u32 ndrift;
+	u32 i;
+	u32 ptp_ts_clk, ptp_inc;
+
+	ptp_ts_clk = clk_get_rate(priv->clk_ptp);
+	ptp_inc = FEC_T_PERIOD_ONE_SEC / ptp_ts_clk;
+
+	ndrift = comp->drift;
+
+	if (ndrift == 0) {
+		ptc->corr_inc = 0;
+		ptc->corr_period = 0;
+		return;
+	}
+
+	for (i = 1; i <= ptp_inc; i++) {
+		if (((i * FEC_T_PERIOD_ONE_SEC) / ndrift) > ptp_inc) {
+			ptc->corr_inc = i;
+			ptc->corr_period = ((i * FEC_T_PERIOD_ONE_SEC) /
+						(ptp_inc * ndrift));
+			break;
+		}
+	}
+
+	/* not found ? */
+	if (i > ptp_inc) {
+		/*
+		 * set it to high value - double speed
+		 * correct in every clock step.
+		 */
+		ptc->corr_inc = ptp_inc;
+		ptc->corr_period = 1;
+	}
+}
+
+static void fec_set_drift(struct fec_enet_private *priv,
+			struct ptp_set_comp *comp)
+{
+	struct ptp_time_correct	tc;
+	u32 tmp, corr_ns;
+	u32 ptp_inc;
+
+	memset(&tc, 0, sizeof(struct ptp_time_correct));
+	fec_handle_ptpdrift(priv, comp, &tc);
+	if (tc.corr_inc == 0)
+		return;
+
+	ptp_inc = FEC_T_PERIOD_ONE_SEC / clk_get_rate(priv->clk_ptp);
+	if (comp->o_ops == TRUE)
+		corr_ns = ptp_inc + tc.corr_inc;
+	else
+		corr_ns = ptp_inc - tc.corr_inc;
+
+	tmp = readl(priv->hwp + FEC_ATIME_INC) & FEC_T_INC_MASK;
+	tmp |= corr_ns << FEC_T_INC_CORR_OFFSET;
+	writel(tmp, priv->hwp + FEC_ATIME_INC);
+	writel(tc.corr_period, priv->hwp + FEC_ATIME_CORR);
 }
 
 /**
@@ -237,16 +543,14 @@ static cycle_t fec_ptp_read(const struct cyclecounter *cc)
 	struct fec_enet_private *fep =
 		container_of(cc, struct fec_enet_private, cc);
 	const struct platform_device_id *id_entry =
-		platform_get_device_id(fep->pdev);
+			platform_get_device_id(fep->pdev);
 	u32 tempval;
 
 	tempval = readl(fep->hwp + FEC_ATIME_CTRL);
 	tempval |= FEC_T_CTRL_CAPTURE;
 	writel(tempval, fep->hwp + FEC_ATIME_CTRL);
-
 	if (id_entry->driver_data & FEC_QUIRK_TKT210590)
 		udelay(1);
-
 	return readl(fep->hwp + FEC_ATIME);
 }
 
@@ -264,23 +568,29 @@ void fec_ptp_start_cyclecounter(struct net_device *ndev)
 	unsigned long flags;
 	int inc;
 
-	inc = 1000000000 / fep->cycle_speed;
+	inc = FEC_T_PERIOD_ONE_SEC / fep->cycle_speed;
 
 	/* grab the ptp lock */
 	spin_lock_irqsave(&fep->tmreg_lock, flags);
+	writel(FEC_T_CTRL_RESTART, fep->hwp + FEC_ATIME_CTRL);
 
 	/* 1ns counter */
 	writel(inc << FEC_T_INC_OFFSET, fep->hwp + FEC_ATIME_INC);
 
-	/* use 31-bit timer counter */
-	writel(FEC_COUNTER_PERIOD, fep->hwp + FEC_ATIME_EVT_PERIOD);
-
-	writel(FEC_T_CTRL_ENABLE | FEC_T_CTRL_PERIOD_RST,
-		fep->hwp + FEC_ATIME_CTRL);
+	if (fep->hwts_rx_en_ioctl || fep->hwts_tx_en_ioctl) {
+		writel(FEC_T_PERIOD_ONE_SEC, fep->hwp + FEC_ATIME_EVT_PERIOD);
+		/* start counter */
+		writel(FEC_T_CTRL_PERIOD_RST | FEC_T_CTRL_ENABLE,
+				fep->hwp + FEC_ATIME_CTRL);
+	} else if (fep->hwts_tx_en || fep->hwts_tx_en) {
+		/* use free running count */
+		writel(0, fep->hwp + FEC_ATIME_EVT_PERIOD);
+		writel(FEC_T_CTRL_ENABLE, fep->hwp + FEC_ATIME_CTRL);
+	}
 
 	memset(&fep->cc, 0, sizeof(fep->cc));
 	fep->cc.read = fec_ptp_read;
-	fep->cc.mask = CLOCKSOURCE_MASK(31);
+	fep->cc.mask = CLOCKSOURCE_MASK(32);
 	fep->cc.shift = 31;
 	fep->cc.mult = FEC_CC_MULT;
 
@@ -288,6 +598,9 @@ void fec_ptp_start_cyclecounter(struct net_device *ndev)
 	timecounter_init(&fep->tc, &fep->cc, ktime_to_ns(ktime_get_real()));
 
 	spin_unlock_irqrestore(&fep->tmreg_lock, flags);
+
+	if (!timer_pending(&fep->time_keep) && fep->opened)
+		add_timer(&fep->time_keep);
 }
 
 /**
@@ -303,60 +616,32 @@ void fec_ptp_start_cyclecounter(struct net_device *ndev)
  */
 static int fec_ptp_adjfreq(struct ptp_clock_info *ptp, s32 ppb)
 {
+	u64 diff;
 	unsigned long flags;
 	int neg_adj = 0;
-	u32 i, tmp;
-	u32 corr_inc, corr_period;
-	u32 corr_ns;
-	u64 lhs, rhs;
+	u32 mult = FEC_CC_MULT;
 
 	struct fec_enet_private *fep =
 	    container_of(ptp, struct fec_enet_private, ptp_caps);
-
-	if (ppb == 0)
-		return 0;
 
 	if (ppb < 0) {
 		ppb = -ppb;
 		neg_adj = 1;
 	}
 
-	/* In theory, corr_inc/corr_period = ppb/NSEC_PER_SEC;
-	 * Try to find the corr_inc  between 1 to fep->ptp_inc to
-	 * meet adjustment requirement.
-	 */
-	lhs = NSEC_PER_SEC;
-	rhs = (u64)ppb * (u64)fep->ptp_inc;
-	for (i = 1; i <= fep->ptp_inc; i++) {
-		if (lhs >= rhs) {
-			corr_inc = i;
-			corr_period = div_u64(lhs, rhs);
-			break;
-		}
-		lhs += NSEC_PER_SEC;
-	}
-	/* Not found? Set it to high value - double speed
-	 * correct in every clock step.
-	 */
-	if (i > fep->ptp_inc) {
-		corr_inc = fep->ptp_inc;
-		corr_period = 1;
-	}
-
-	if (neg_adj)
-		corr_ns = fep->ptp_inc - corr_inc;
-	else
-		corr_ns = fep->ptp_inc + corr_inc;
+	diff = mult;
+	diff *= ppb;
+	diff = div_u64(diff, 1000000000ULL);
 
 	spin_lock_irqsave(&fep->tmreg_lock, flags);
-
-	tmp = readl(fep->hwp + FEC_ATIME_INC) & FEC_T_INC_MASK;
-	tmp |= corr_ns << FEC_T_INC_CORR_OFFSET;
-	writel(tmp, fep->hwp + FEC_ATIME_INC);
-	corr_period = corr_period > 1 ? corr_period - 1 : corr_period;
-	writel(corr_period, fep->hwp + FEC_ATIME_CORR);
-	/* dummy read to update the timer. */
+	/*
+	 * dummy read to set cycle_last in tc to now.
+	 * So use adjusted mult to calculate when next call
+	 * timercounter_read.
+	 */
 	timecounter_read(&fep->tc);
+
+	fep->cc.mult = neg_adj ? mult - diff : mult + diff;
 
 	spin_unlock_irqrestore(&fep->tmreg_lock, flags);
 
@@ -376,18 +661,11 @@ static int fec_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta)
 	    container_of(ptp, struct fec_enet_private, ptp_caps);
 	unsigned long flags;
 	u64 now;
-	u32 counter;
 
 	spin_lock_irqsave(&fep->tmreg_lock, flags);
 
 	now = timecounter_read(&fep->tc);
 	now += delta;
-
-	/* Get the timer value based on adjusted timestamp.
-	 * Update the counter with the masked value.
-	 */
-	counter = now & fep->cc.mask;
-	writel(counter, fep->hwp + FEC_ATIME);
 
 	/* reset the timecounter */
 	timecounter_init(&fep->tc, &fep->cc, now);
@@ -439,27 +717,13 @@ static int fec_ptp_settime(struct ptp_clock_info *ptp,
 
 	u64 ns;
 	unsigned long flags;
-	u32 counter;
-
-	mutex_lock(&fep->ptp_clk_mutex);
-	/* Check the ptp clock */
-	if (!fep->ptp_clk_on) {
-		mutex_unlock(&fep->ptp_clk_mutex);
-		return -EINVAL;
-	}
 
 	ns = ts->tv_sec * 1000000000ULL;
 	ns += ts->tv_nsec;
-	/* Get the timer value based on timestamp.
-	 * Update the counter with the masked value.
-	 */
-	counter = ns & fep->cc.mask;
 
 	spin_lock_irqsave(&fep->tmreg_lock, flags);
-	writel(counter, fep->hwp + FEC_ATIME);
 	timecounter_init(&fep->tc, &fep->cc, ns);
 	spin_unlock_irqrestore(&fep->tmreg_lock, flags);
-	mutex_unlock(&fep->ptp_clk_mutex);
 	return 0;
 }
 
@@ -473,15 +737,6 @@ static int fec_ptp_settime(struct ptp_clock_info *ptp,
 static int fec_ptp_enable(struct ptp_clock_info *ptp,
 			  struct ptp_clock_request *rq, int on)
 {
-	struct fec_enet_private *fep =
-	    container_of(ptp, struct fec_enet_private, ptp_caps);
-	int ret = 0;
-
-	if (rq->type == PTP_CLK_REQ_PPS) {
-		ret = fec_ptp_enable_pps(fep, on);
-
-		return ret;
-	}
 	return -EOPNOTSUPP;
 }
 
@@ -491,87 +746,164 @@ static int fec_ptp_enable(struct ptp_clock_info *ptp,
  * @ifreq: ioctl data
  * @cmd: particular ioctl requested
  */
-int fec_ptp_set(struct net_device *ndev, struct ifreq *ifr)
+int fec_ptp_ioctl(struct net_device *ndev, struct ifreq *ifr, int cmd)
 {
 	struct fec_enet_private *fep = netdev_priv(ndev);
-
 	struct hwtstamp_config config;
+	struct ptp_rtc_time curr_time;
+	struct ptp_time rx_time, tx_time;
+	struct fec_ptp_ts_data p_ts;
+	struct fec_ptp_ts_data *p_ts_user;
+	struct ptp_set_comp p_comp;
+	u32 freq_compensation;
+	int retval = 0;
 
-	if (copy_from_user(&config, ifr->ifr_data, sizeof(config)))
-		return -EFAULT;
+	switch (cmd) {
+	case SIOCSHWTSTAMP:
+		if (copy_from_user(&config, ifr->ifr_data, sizeof(config)))
+			return -EFAULT;
 
-	/* reserved for future extensions */
-	if (config.flags)
-		return -EINVAL;
+		/* reserved for future extensions */
+		if (config.flags)
+			return -EINVAL;
 
-	switch (config.tx_type) {
-	case HWTSTAMP_TX_OFF:
+		switch (config.tx_type) {
+		case HWTSTAMP_TX_OFF:
+			fep->hwts_tx_en = 0;
+			break;
+		case HWTSTAMP_TX_ON:
+			fep->hwts_tx_en = 1;
+			fep->hwts_tx_en_ioctl = 0;
+			break;
+		default:
+			return -ERANGE;
+		}
+
+		switch (config.rx_filter) {
+		case HWTSTAMP_FILTER_NONE:
+			if (fep->hwts_rx_en)
+				fep->hwts_rx_en = 0;
+			config.rx_filter = HWTSTAMP_FILTER_NONE;
+			break;
+
+		default:
+			/*
+			 * register RXMTRL must be set in order
+			 * to do V1 packets, therefore it is not
+			 * possible to time stamp both V1 Sync and
+			 * Delay_Req messages and hardware does not support
+			 * timestamping all packets => return error
+			 */
+			fep->hwts_rx_en = 1;
+			fep->hwts_rx_en_ioctl = 0;
+			config.rx_filter = HWTSTAMP_FILTER_ALL;
+			break;
+		}
+
+		fec_ptp_start_cyclecounter(ndev);
+		return copy_to_user(ifr->ifr_data, &config, sizeof(config)) ?
+		    -EFAULT : 0;
+		break;
+	case PTP_ENBL_TXTS_IOCTL:
+	case PTP_ENBL_RXTS_IOCTL:
+		fep->hwts_rx_en_ioctl = 1;
+		fep->hwts_tx_en_ioctl = 1;
+		fep->hwts_rx_en = 0;
 		fep->hwts_tx_en = 0;
+		fec_ptp_start_cyclecounter(ndev);
 		break;
-	case HWTSTAMP_TX_ON:
-		fep->hwts_tx_en = 1;
+	case PTP_DSBL_RXTS_IOCTL:
+	case PTP_DSBL_TXTS_IOCTL:
+		fep->hwts_rx_en_ioctl = 0;
+		fep->hwts_tx_en_ioctl = 0;
+		break;
+	case PTP_GET_RX_TIMESTAMP:
+		p_ts_user = (struct fec_ptp_ts_data *)ifr->ifr_data;
+		if (0 != copy_from_user(&p_ts.ident,
+			&p_ts_user->ident, sizeof(p_ts.ident)))
+			return -EINVAL;
+
+		if (fec_ptp_find_and_remove(&fep->rx_timestamps,
+			&p_ts.ident, &rx_time)) {
+			usleep_range(4000, 5000);
+			return -EAGAIN;
+		}
+		if (copy_to_user((void __user *)(&p_ts_user->ts),
+			&rx_time, sizeof(rx_time)))
+			return -EFAULT;
+		break;
+	case PTP_GET_TX_TIMESTAMP:
+		p_ts_user = (struct fec_ptp_ts_data *)ifr->ifr_data;
+		if (0 != copy_from_user(&p_ts.ident,
+			&p_ts_user->ident, sizeof(p_ts.ident)))
+			return -EINVAL;
+
+		if (fec_ptp_find_and_remove(&fep->tx_timestamps,
+			&p_ts.ident, &tx_time)) {
+			usleep_range(4000, 5000);
+			return -EAGAIN;
+		}
+		if (copy_to_user((void __user *)(&p_ts_user->ts),
+			&tx_time, sizeof(tx_time)))
+			return -EFAULT;
+		break;
+	case PTP_GET_CURRENT_TIME:
+		fec_get_curr_cnt(fep, &curr_time);
+		if (0 != copy_to_user(ifr->ifr_data,
+					&(curr_time.rtc_time),
+					sizeof(struct ptp_time)))
+			return -EFAULT;
+		break;
+	case PTP_SET_RTC_TIME:
+		if (0 != copy_from_user(&(curr_time.rtc_time),
+					ifr->ifr_data,
+					sizeof(struct ptp_time)))
+			return -EINVAL;
+		fec_set_1588cnt(fep, &curr_time);
+		break;
+	case PTP_FLUSH_TIMESTAMP:
+		/* reset tx-timestamping buffer */
+		fep->tx_timestamps.front = 0;
+		fep->tx_timestamps.end = 0;
+		fep->tx_timestamps.size = (DEFAULT_PTP_TX_BUF_SZ + 1);
+		/* reset rx-timestamping buffer */
+		fep->rx_timestamps.front = 0;
+		fep->rx_timestamps.end = 0;
+		fep->rx_timestamps.size = (DEFAULT_PTP_RX_BUF_SZ + 1);
+		break;
+	case PTP_SET_COMPENSATION:
+		if (0 != copy_from_user(&p_comp, ifr->ifr_data,
+			sizeof(struct ptp_set_comp)))
+			return -EINVAL;
+		fec_set_drift(fep, &p_comp);
+		break;
+	case PTP_GET_ORIG_COMP:
+		freq_compensation = FEC_PTP_ORIG_COMP;
+		if (copy_to_user(ifr->ifr_data, &freq_compensation,
+					sizeof(freq_compensation)) > 0)
+			return -EFAULT;
 		break;
 	default:
-		return -ERANGE;
+		return -EINVAL;
 	}
 
-	switch (config.rx_filter) {
-	case HWTSTAMP_FILTER_NONE:
-		if (fep->hwts_rx_en)
-			fep->hwts_rx_en = 0;
-		config.rx_filter = HWTSTAMP_FILTER_NONE;
-		break;
-
-	default:
-		/*
-		 * register RXMTRL must be set in order to do V1 packets,
-		 * therefore it is not possible to time stamp both V1 Sync and
-		 * Delay_Req messages and hardware does not support
-		 * timestamping all packets => return error
-		 */
-		fep->hwts_rx_en = 1;
-		config.rx_filter = HWTSTAMP_FILTER_ALL;
-		break;
-	}
-
-	return copy_to_user(ifr->ifr_data, &config, sizeof(config)) ?
-	    -EFAULT : 0;
+	return retval;
 }
-
-int fec_ptp_get(struct net_device *ndev, struct ifreq *ifr)
-{
-	struct fec_enet_private *fep = netdev_priv(ndev);
-	struct hwtstamp_config config;
-
-	config.flags = 0;
-	config.tx_type = fep->hwts_tx_en ? HWTSTAMP_TX_ON : HWTSTAMP_TX_OFF;
-	config.rx_filter = (fep->hwts_rx_en ?
-			    HWTSTAMP_FILTER_ALL : HWTSTAMP_FILTER_NONE);
-
-	return copy_to_user(ifr->ifr_data, &config, sizeof(config)) ?
-		-EFAULT : 0;
-}
-
 /**
  * fec_time_keep - call timecounter_read every second to avoid timer overrun
  *                 because ENET just support 32bit counter, will timeout in 4s
  */
-static void fec_time_keep(struct work_struct *work)
+static void fec_time_keep(unsigned long _data)
 {
-	struct delayed_work *dwork = to_delayed_work(work);
-	struct fec_enet_private *fep = container_of(dwork, struct fec_enet_private, time_keep);
+	struct fec_enet_private *fep = (struct fec_enet_private *)_data;
 	u64 ns;
 	unsigned long flags;
 
-	mutex_lock(&fep->ptp_clk_mutex);
-	if (fep->ptp_clk_on) {
-		spin_lock_irqsave(&fep->tmreg_lock, flags);
-		ns = timecounter_read(&fep->tc);
-		spin_unlock_irqrestore(&fep->tmreg_lock, flags);
-	}
-	mutex_unlock(&fep->ptp_clk_mutex);
+	spin_lock_irqsave(&fep->tmreg_lock, flags);
+	ns = timecounter_read(&fep->tc);
+	spin_unlock_irqrestore(&fep->tmreg_lock, flags);
 
-	schedule_delayed_work(&fep->time_keep, HZ);
+	mod_timer(&fep->time_keep, jiffies + HZ);
 }
 
 /**
@@ -595,8 +927,7 @@ void fec_ptp_init(struct platform_device *pdev)
 	fep->ptp_caps.n_alarm = 0;
 	fep->ptp_caps.n_ext_ts = 0;
 	fep->ptp_caps.n_per_out = 0;
-	fep->ptp_caps.n_pins = 0;
-	fep->ptp_caps.pps = 1;
+	fep->ptp_caps.pps = 0;
 	fep->ptp_caps.adjfreq = fec_ptp_adjfreq;
 	fep->ptp_caps.adjtime = fec_ptp_adjtime;
 	fep->ptp_caps.gettime = fec_ptp_gettime;
@@ -604,13 +935,15 @@ void fec_ptp_init(struct platform_device *pdev)
 	fep->ptp_caps.enable = fec_ptp_enable;
 
 	fep->cycle_speed = clk_get_rate(fep->clk_ptp);
-	fep->ptp_inc = NSEC_PER_SEC / fep->cycle_speed;
 
 	spin_lock_init(&fep->tmreg_lock);
 
 	fec_ptp_start_cyclecounter(ndev);
 
-	INIT_DELAYED_WORK(&fep->time_keep, fec_time_keep);
+	init_timer(&fep->time_keep);
+	fep->time_keep.data = (unsigned long)fep;
+	fep->time_keep.function = fec_time_keep;
+	fep->time_keep.expires = jiffies + HZ;
 
 	fep->ptp_clock = ptp_clock_register(&fep->ptp_caps, &pdev->dev);
 	if (IS_ERR(fep->ptp_clock)) {
@@ -618,38 +951,21 @@ void fec_ptp_init(struct platform_device *pdev)
 		pr_err("ptp_clock_register failed\n");
 	}
 
-	schedule_delayed_work(&fep->time_keep, HZ);
+	/* initialize circular buffer for tx timestamps */
+	if (fec_ptp_init_circ(&(fep->tx_timestamps),
+		(DEFAULT_PTP_TX_BUF_SZ+1)))
+		pr_err("init tx circular buffer failed\n");
+	/* initialize circular buffer for rx timestamps */
+	if (fec_ptp_init_circ(&(fep->rx_timestamps),
+			(DEFAULT_PTP_RX_BUF_SZ+1)))
+		pr_err("init rx curcular buffer failed\n");
 }
 
-/**
- * fec_ptp_check_pps_event
- * @fep: the fec_enet_private structure handle
- *
- * This function check the pps event and reload the timer compare counter.
- */
-uint fec_ptp_check_pps_event(struct fec_enet_private *fep)
+void fec_ptp_cleanup(struct fec_enet_private *priv)
 {
-	u32 val;
-	u8 channel = fep->pps_channel;
-	struct ptp_clock_event event;
-
-	val = readl(fep->hwp + FEC_TCSR(channel));
-	if (val & FEC_T_TF_MASK) {
-		/* Write the next next compare(not the next according the spec)
-		 * value to the register
-		 */
-		writel(fep->next_counter, fep->hwp + FEC_TCCR(channel));
-		do {
-			writel(val, fep->hwp + FEC_TCSR(channel));
-		} while (readl(fep->hwp + FEC_TCSR(channel)) & FEC_T_TF_MASK);
-
-		/* Update the counter; */
-		fep->next_counter = (fep->next_counter + fep->reload_period) & fep->cc.mask;
-
-		event.type = PTP_CLOCK_PPS;
-		ptp_clock_event(fep->ptp_clock, &event);
-		return 1;
-	}
-
-	return 0;
+	if (priv->tx_timestamps.data_buf)
+		vfree(priv->tx_timestamps.data_buf);
+	if (priv->rx_timestamps.data_buf)
+		vfree(priv->rx_timestamps.data_buf);
 }
+
